@@ -1,7 +1,7 @@
 # caddy-cloudflare
 
 Ce dépôt compile Caddy avec le module DNS Cloudflare (`github.com/caddy-dns/cloudflare`).
-Le binaire sert au défi DNS ACME de `caddy-proxy-01`.
+Le binaire sert à obtenir des certificats par défi DNS ACME chez Cloudflare.
 Chaque release contient le binaire, ses empreintes et une signature minisign.
 
 ## Fichiers d'une release
@@ -58,6 +58,6 @@ Si elle est perdue ou compromise, on régénère une paire.
    `gh secret set MINISIGN_SECRET_KEY --repo iBroStudio/caddy-cloudflare < <dossier temporaire>/minisign.key`.
 3. Supprimer la clé privée locale.
 4. Commiter le nouveau `minisign.pub`.
-5. Redéployer la clé publique sur le proxy.
+5. Redéployer la clé publique sur les serveurs qui vérifient les releases.
 
 Les releases déjà publiées restent signées par l'ancienne clé.
