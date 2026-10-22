@@ -1,0 +1,174 @@
+name: build
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version exacte de Caddy (ex. 2.11.7). Vide : dernière stable, délai de 7 jours."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: caddy-cloudflare-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Choix de la version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            version="$INPUT_VERSION"
+            check_delay=false
+          else
+            tag=$(gh api repos/caddyserver/caddy/releases/latest -q .tag_name)
+            published=$(gh api repos/caddyserver/caddy/releases/latest -q .published_at)
+            version="${tag#v}"
+            check_delay=true
+          fi
+
+          if ! [[ "$version" =~ ^2\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error title=Version refusée::version '$version' refusée (attendu : 2.x.y stable)"
+            exit 1
+          fi
+
+          if [ "$check_delay" = true ]; then
+            eligible=$(( $(date -u -d "$published" +%s) + 7 * 86400 ))
+            if [ "$(date -u +%s)" -lt "$eligible" ]; then
+              msg="version $version trop récente, compilée après le $(date -u -d "@$eligible" +%d/%m)"
+              echo "::notice title=Compilation reportée::$msg"
+              echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            msg="v$version déjà publiée"
+            echo "::notice title=Rien à faire::$msg"
+            echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "image=caddy:$version-builder" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Version du module
+        id: module
+        if: steps.version.outputs.skip == 'false'
+        env:
+          IMAGE: ${{ steps.version.outputs.image }}
+        run: |
+          set -euo pipefail
+          module=$(docker run --rm -w /tmp "$IMAGE" \
+            go list -m -f '{{.Version}}' github.com/caddy-dns/cloudflare@latest)
+          if ! [[ "$module" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error title=Module::version du module inattendue : '$module'"
+            exit 1
+          fi
+          echo "module=$module" >> "$GITHUB_OUTPUT"
+
+      - name: Compilation
+        if: steps.version.outputs.skip == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          IMAGE: ${{ steps.version.outputs.image }}
+          MODULE: ${{ steps.module.outputs.module }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          docker run --rm -v "$PWD/dist:/out" \
+            -e CGO_ENABLED=0 -e GOOS=linux -e GOARCH=amd64 -e XCADDY_SETCAP=0 \
+            "$IMAGE" \
+            xcaddy build "v$VERSION" \
+              --with "github.com/caddy-dns/cloudflare@$MODULE" \
+              --output /out/caddy-linux-amd64
+
+      - name: Contrôles
+        if: steps.version.outputs.skip == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          bin=dist/caddy-linux-amd64
+
+          reported=$("$bin" version | awk 'NR==1 {print $1}')
+          echo "version : $reported"
+          [ "$reported" = "v$VERSION" ] || { echo "::error title=Contrôle::version '$reported' au lieu de v$VERSION"; exit 1; }
+
+          modules=$("$bin" list-modules)
+          grep -qx 'dns.providers.cloudflare' <<<"$modules" \
+            || { echo "::error title=Contrôle::dns.providers.cloudflare absent de list-modules"; exit 1; }
+
+          info=$(file "$bin")
+          echo "$info"
+          grep -q 'ELF 64-bit LSB executable, x86-64' <<<"$info" \
+            && grep -q 'statically linked' <<<"$info" \
+            || { echo "::error title=Contrôle::pas un exécutable x86-64 statique"; exit 1; }
+
+      - name: Empreintes et signature
+        if: steps.version.outputs.skip == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          MODULE: ${{ steps.module.outputs.module }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq minisign
+
+          (cd dist && sha256sum caddy-linux-amd64 > SHA256SUMS)
+
+          umask 077
+          key=$(mktemp)
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+          minisign -S -s "$key" -m dist/SHA256SUMS \
+            -t "caddy v$VERSION + caddy-dns/cloudflare $MODULE"
+
+          minisign -Vm dist/SHA256SUMS -p minisign.pub
+
+      - name: Release
+        if: steps.version.outputs.skip == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          MODULE: ${{ steps.module.outputs.module }}
+          IMAGE: ${{ steps.version.outputs.image }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          - Caddy : v$VERSION
+          - Module : github.com/caddy-dns/cloudflare $MODULE
+          - Image de compilation : $IMAGE
+          - Cible : linux/amd64, statique (CGO_ENABLED=0)
+
+          Vérification :
+
+          \`\`\`
+          minisign -Vm SHA256SUMS -p minisign.pub
+          sha256sum -c SHA256SUMS
+          \`\`\`
+          EOF
+          gh release create "v$VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Caddy v$VERSION + Cloudflare DNS" \
+            --notes-file notes.md \
+            dist/caddy-linux-amd64 dist/SHA256SUMS dist/SHA256SUMS.minisig
+          echo "::notice title=Release publiée::v$VERSION avec caddy-dns/cloudflare $MODULE"
